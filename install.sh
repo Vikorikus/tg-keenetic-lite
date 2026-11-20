@@ -25,8 +25,12 @@ _m=$(uname -m)
 case "$_m" in
     aarch64|arm64)            ARCH="aarch64" ;;
     armv7*|armv6*|arm*|armel) ARCH="armv7" ;;
-    mips|mips-bigendian)      ARCH="mips" ;;
-    mipsel|mipsle|*mipsel*)   ARCH="mipsel" ;;
+    mips-bigendian)           ARCH="mips" ;;
+    mips|mipsel|mipsle|*mipsel*)
+        # На Keenetic (MT7628/MT7621/EN75xx и др.) uname -m часто отдаёт "mips"
+        # при little-endian ядре, поэтому по умолчанию берём mipsel.
+        ARCH="mipsel"
+        ;;
     *) echo "Неподдерживаемая архитектура: '$_m' (ожидается mipsel/mips/armv7/aarch64)"; exit 1 ;;
 esac
 echo "Архитектура: $_m -> bin/$ARCH"
@@ -80,8 +84,9 @@ command -v conntrack >/dev/null 2>&1 || opkg install conntrack >/dev/null 2>&1 |
 # --- 5. Останавливаем старый экземпляр (идемпотентная переустановка) -----------
 [ -x /opt/etc/init.d/S99tg-proxy ] && /opt/etc/init.d/S99tg-proxy stop >/dev/null 2>&1
 
-# --- 6. Конфиг и списки: /opt/etc/tg-proxy/ ------------------------------------
-mkdir -p /opt/etc/tg-proxy || exit 1
+# --- 6. Конфиг, списки и рабочая директория состояния ------------------------
+mkdir -p /opt/etc/tg-proxy /opt/zapret2 || exit 1
+chmod 755 /opt/zapret2 2>/dev/null || true
 cp -f "$SRC/tg-redirect.sh"  /opt/etc/tg-proxy/tg-redirect.sh
 cp -f "$SRC/95-tg-proxy.sh"  /opt/etc/tg-proxy/95-tg-proxy.sh
 cp -f "$SRC/telegram_ips.txt"  /opt/etc/tg-proxy/telegram_ips.txt 2>/dev/null || true
