@@ -1,0 +1,183 @@
+#!/bin/sh
+# /opt/etc/init.d/S99tg-proxy — tg-keenetic-lite.
+#
+# start/stop/restart/status демон tg-mtproxy-client (локальный прозрачный
+# прокси Telegram, порт :1443) и управление iptables/ipset-правилами
+# REDIRECT: весь трафик Telegram DC (TCP 443) из сети и с самого роутера
+# уводится на :1443.
+#
+# POSIX sh, BusyBox ash. Никаких bash-измов.
+
+export PATH=/opt/sbin:/opt/bin:/sbin:/usr/sbin:/bin:/usr/bin
+
+BIN="/opt/sbin/tg-mtproxy-client"
+LIB="/opt/etc/tg-proxy/tg-redirect.sh"
+PORT="1443"
+LOG="/tmp/tg-proxy.log"
+PIDFILE="/var/run/tg-proxy.pid"
+GENFILE="/var/run/tg-proxy.gen"
+LOGMAX=262144   # 256 KiB — вращаем, чтобы не сжирать RAM-диск
+
+# --- вспомогательное -------------------------------------------------------
+
+_is_supervisor() {
+    # $1=pid: живёт ли процесс-надзиратель именно нашего init-скрипта
+    [ -n "$1" ] || return 1
+    kill -0 "$1" 2>/dev/null || return 1
+    [ -r "/proc/$1/cmdline" ] || return 0   # cmdline не читается — доверяем pidfile
+    tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q "S99tg-proxy"
+}
+
+_daemon_running() {
+    # есть ли демон с --listen=:1443
+    pidof tg-mtproxy-client >/dev/null 2>&1 || return 1
+    for p in $(pidof tg-mtproxy-client); do
+        [ -r "/proc/$p/cmdline" ] || continue
+        tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- "--listen=:1443" && return 0
+    done
+    return 1
+}
+
+_log_rotate() {
+    [ -f "$LOG" ] || return 0
+    _sz=$(wc -c < "$LOG" 2>/dev/null)
+    [ -n "$_sz" ] || return 0
+    if [ "$_sz" -gt "$LOGMAX" ]; then
+        : > "$LOG" 2>/dev/null
+    fi
+}
+
+# --- start -------------------------------------------------------------------
+
+start() {
+    [ -x "$BIN" ] || { echo "tg-proxy: бинарник не найден: $BIN"; return 1; }
+    [ -r "$LIB" ] || { echo "tg-proxy: lib не найден: $LIB"; return 1; }
+    . "$LIB"
+
+    # Живой надзиратель уже есть — второй не поднимать (дубликаты делят :1443
+    # и уходят в цикл перезапусков — инцидент, задокументированный в z2k).
+    if [ -f "$PIDFILE" ]; then
+        _sup=$(cat "$PIDFILE" 2>/dev/null)
+        if _is_supervisor "$_sup"; then
+            echo "tg-proxy: уже запущен (supervisor pid $_sup)"
+            return 0
+        fi
+    fi
+    if _daemon_running; then
+        echo "tg-proxy: демон уже слушает :$PORT"
+        tgl_ensure_rules || true
+        return 0
+    fi
+
+    echo "tg-proxy: запускаю надзирателя..."
+    _sup_gen="$(date +%s 2>/dev/null || echo 0).$$"
+    echo "$_sup_gen" > "$GENFILE" 2>/dev/null
+
+    (
+        # trap '' HUP — фикс MIPS/busybox: HUP, доставленный фоновым детям при
+        # выходе обёртки, валил Go-процесс (fatal: index out of range в
+        # async-preempt). Отключаем async preemption для всей ветки.
+        trap '' HUP
+        trap 'kill "$child" 2>/dev/null; exit 0' TERM INT
+        backoff=1
+        while :; do
+            # Сменилось поколение — нас заменили, уходим сами.
+            if [ "$(cat "$GENFILE" 2>/dev/null)" != "$_sup_gen" ]; then
+                echo "$(date 2>/dev/null) [supervisor] новое поколение — выхожу" >> "$LOG"
+                exit 0
+            fi
+            _log_rotate
+            t0=$(date +%s 2>/dev/null || echo 0)
+            GODEBUG=asyncpreemptoff=1 GOGC=20 GOMEMLIMIT=20MiB \
+                $BIN --listen=:$PORT --timeout=15m -v </dev/null >> "$LOG" 2>&1 &
+            child=$!
+            wait "$child"
+            t1=$(date +%s 2>/dev/null || echo 0)
+            if [ $((t1 - t0)) -ge 60 ]; then
+                backoff=1
+            else
+                backoff=$((backoff * 2)); [ "$backoff" -gt 30 ] && backoff=30
+            fi
+            echo "$(date 2>/dev/null) [supervisor] демон остановился, рестарт через ${backoff}s" >> "$LOG"
+            sleep "$backoff"
+        done
+    ) >/dev/null 2>&1 </dev/null &
+    echo $! > "$PIDFILE" 2>/dev/null
+    sleep 2
+
+    # Правила: ipset + REDIRECT (v4) и fast-REJECT (v6), conntrack flush.
+    # Идентичны тем, что подставляет NDM-хук 95-tg-proxy.sh.
+    tgl_ensure_rules
+    _rc=$?
+    tgl_flush_conntrack
+    return $_rc
+}
+
+# --- stop --------------------------------------------------------------------
+
+stop() {
+    echo "tg-proxy: остановка..."
+    # 1) Убиваем надзирателя (pidfile) — его TERM-трап уводит и демона.
+    if [ -f "$PIDFILE" ]; then
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+    fi
+    # 2) Осиротевшие надзиратели (ppid=1, cmdline S99tg-proxy), кроме нас.
+    for _pd in /proc/[0-9]*; do
+        p="${_pd#/proc/}"
+        [ "$p" = "$$" ] && continue
+        [ -r "$_pd/cmdline" ] || continue
+        tr '\0' ' ' < "$_pd/cmdline" 2>/dev/null | grep -q "S99tg-proxy" || continue
+        [ "$(awk '/^PPid:/{print $2}' "$_pd/status" 2>/dev/null)" = "1" ] || continue
+        kill "$p" 2>/dev/null
+    done
+    # 3) Демон на :1443, если пережил.
+    if pidof tg-mtproxy-client >/dev/null 2>&1; then
+        for p in $(pidof tg-mtproxy-client); do
+            [ -r "/proc/$p/cmdline" ] || continue
+            if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- "--listen=:1443"; then
+                kill "$p" 2>/dev/null
+            fi
+        done
+    fi
+    rm -f "$PIDFILE" "$GENFILE"
+    # 4) Снимаем правила (ipset оставляем — дёшево, переиспользуется при старте).
+    [ -r "$LIB" ] && { . "$LIB"; tgl_remove_rules; }
+    return 0
+}
+
+# --- status ------------------------------------------------------------------
+
+status() {
+    _rc=0
+    if [ -f "$PIDFILE" ] && _is_supervisor "$(cat "$PIDFILE" 2>/dev/null)"; then
+        echo "tg-proxy: supervisor запущен (pid $(cat "$PIDFILE" 2>/dev/null))"
+    else
+        echo "tg-proxy: supervisor НЕ запущен"
+        _rc=1
+    fi
+    if _daemon_running; then
+        echo "tg-proxy: демон слушает :$PORT"
+    else
+        echo "tg-proxy: демон на :$PORT не найден"
+        [ "$_rc" = "0" ] && _rc=1
+    fi
+    if [ -r "$LIB" ]; then
+        . "$LIB"
+        if tgl_rule_present PREROUTING && tgl_rule_present OUTPUT; then
+            echo "tg-proxy: REDIRECT-правила на месте (ipset $TGL_SET -> :$PORT)"
+        else
+            echo "tg-proxy: REDIRECT-правила НЕ установлены"
+            _rc=1
+        fi
+    fi
+    return $_rc
+}
+
+case "$1" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; sleep 1; start ;;
+    status) status ;;
+    *) echo "Usage: $0 {start|stop|restart|status}" ;;
+esac
